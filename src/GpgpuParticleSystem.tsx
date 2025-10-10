@@ -3,6 +3,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { useMemo, useRef } from 'react'
 import * as THREE from 'three'
 
+// Shader to update particle positions
 const simulationVertexShader = `
   varying vec2 vUv;
   void main() {
@@ -13,108 +14,91 @@ const simulationVertexShader = `
 
 const simulationFragmentShader = `
   varying vec2 vUv;
-  uniform sampler2D uPositions;
+  uniform sampler2D uOriginalPositions;
   uniform vec3 uMouse;
   uniform float uTime;
-  uniform float uDelta;
 
-  // Simple pseudo-random number generator
-  float rand(vec2 co){
-    return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+  // 2D Random
+  float random (vec2 st) {
+    return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+  }
+
+  // 2D Noise
+  float noise (vec2 st) {
+    vec2 i = floor(st);
+    vec2 f = fract(st);
+    float a = random(i);
+    float b = random(i + vec2(1.0, 0.0));
+    float c = random(i + vec2(0.0, 1.0));
+    float d = random(i + vec2(1.0, 1.0));
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(a, b, u.x) + (c - a)* u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
   }
 
   void main() {
-    vec4 posTemp = texture2D(uPositions, vUv);
-    vec3 pos = posTemp.xyz;
-    vec3 vel = posTemp.w > 0.0 ? (pos - texture2D(uPositions, vUv - vec2(0.0, 1.0 / 512.0)).xyz) : vec3(0.0);
+    vec3 originalPos = texture2D(uOriginalPositions, vUv).xyz;
 
-    // Verlet integration: apply forces
-    vel += vec3(0.0, -0.0005, 0.0); // Gravity
+    // Displace particles using noise for organic movement
+    float n = noise(originalPos.xy * 0.5 + uTime * 0.1);
+    vec3 displacedPos = originalPos + vec3(
+      cos(uTime * 0.2 + originalPos.x * 2.0) * n * 0.5,
+      sin(uTime * 0.3 + originalPos.y * 2.0) * n * 0.5,
+      cos(uTime * 0.4 + originalPos.z * 2.0) * n * 0.5
+    );
 
-    // Mouse interaction
-    float dist = distance(pos, uMouse);
-    if (dist < 2.0) {
-      vec3 dir = normalize(pos - uMouse);
-      vel += dir * ( (2.0 - dist) * 0.01 );
+    // Mouse interaction: push particles away
+    float dist = distance(displacedPos, uMouse);
+    if (dist < 1.5) {
+      vec3 dir = normalize(displacedPos - uMouse);
+      displacedPos += dir * (1.5 - dist) * 0.5;
     }
 
-    // Bounce off floor
-    if (pos.y < -5.0) {
-      pos.y = -5.0;
-      vel.y *= -0.8;
-    }
-
-    vec3 newPos = pos + vel * uDelta;
-
-    gl_FragColor = vec4(newPos, 1.0);
+    gl_FragColor = vec4(displacedPos, 1.0);
   }
 `
 
+// Shader to render the particles
 const particleVertexShader = `
   uniform sampler2D uPositions;
   uniform float uSize;
   void main() {
     vec3 pos = texture2D(uPositions, position.xy).xyz;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
-    gl_PointSize = uSize / -mvPosition.z;
+    vec4 modelPosition = modelMatrix * vec4(pos, 1.0);
+    vec4 viewPosition = viewMatrix * modelPosition;
+    gl_Position = projectionMatrix * viewPosition;
+    gl_PointSize = uSize * (1.0 / -viewPosition.z);
   }
 `
 
 const particleFragmentShader = `
-  uniform vec3 uColor;
-  uniform vec3 uSpecularColor;
-  uniform float uShininess;
-
   void main() {
-    // Render particle as a lit sphere with PBR-like effects
-    vec2 uv = gl_PointCoord.xy - vec2(0.5);
-    float dist = length(uv);
+    float dist = length(gl_PointCoord - vec2(0.5));
     if (dist > 0.5) discard;
-
     float alpha = 1.0 - smoothstep(0.45, 0.5, dist);
-
-    // Normal of the sphere-like particle
-    vec3 normal = normalize(vec3(uv.x, uv.y, sqrt(1.0 - pow(dist, 2.0))));
-
-    // Lighting (Blinn-Phong)
-    vec3 lightDir = normalize(vec3(1.0, 2.0, 3.0));
-    vec3 viewDir = normalize(- (modelViewMatrix * vec4(position, 1.0)).xyz);
-    vec3 halfwayDir = normalize(lightDir + viewDir);
-
-    // Diffuse
-    float diffuse = max(dot(normal, lightDir), 0.0);
-    vec3 diffuseColor = diffuse * uColor;
-
-    // Specular
-    float spec = pow(max(dot(normal, halfwayDir), 0.0), uShininess);
-    vec3 specularColor = spec * uSpecularColor;
-
-    vec3 finalColor = diffuseColor + specularColor;
-
-    gl_FragColor = vec4(finalColor, alpha);
+    gl_FragColor = vec4(vec3(0.2, 0.5, 1.0) * alpha, alpha);
   }
 `
 
-const SIZE = 512
+const SIZE = 256 // Reduced size for stability
 
 export default function GpgpuParticleSystem() {
   const { viewport } = useThree()
-  const pointsRef = useRef<THREE.Points>(null!)
-  const simMaterialRef = useRef<THREE.ShaderMaterial>(null!)
   const renderMaterialRef = useRef<THREE.ShaderMaterial>(null!)
 
   const scene = useMemo(() => new THREE.Scene(), [])
   const camera = useMemo(() => new THREE.OrthographicCamera(-1, 1, 1, -1, 1 / Math.pow(2, 53), 1), [])
 
-  const positions = useMemo(() => {
+  const originalPositions = useMemo(() => {
     const arr = new Float32Array(SIZE * SIZE * 4)
     for (let i = 0; i < SIZE * SIZE; i++) {
-      arr[i * 4 + 0] = (Math.random() - 0.5) * 5
-      arr[i * 4 + 1] = (Math.random() - 0.5) * 5
-      arr[i * 4 + 2] = (Math.random() - 0.5) * 5
-      arr[i * 4 + 3] = 0.0 // Initial velocity placeholder
+      arr[i * 4 + 0] = (Math.random() - 0.5) * 10
+      arr[i * 4 + 1] = (Math.random() - 0.5) * 10
+      arr[i * 4 + 2] = (Math.random() - 0.5) * 10
+      arr[i * 4 + 3] = Math.random()
     }
-    return new THREE.DataTexture(arr, SIZE, SIZE, THREE.RGBAFormat, THREE.FloatType)
+    const texture = new THREE.DataTexture(arr, SIZE, SIZE, THREE.RGBAFormat, THREE.FloatType)
+    texture.needsUpdate = true
+    return texture
   }, [])
 
   const rtt = useFBO(SIZE, SIZE, {
@@ -122,7 +106,6 @@ export default function GpgpuParticleSystem() {
     magFilter: THREE.NearestFilter,
     format: THREE.RGBAFormat,
     type: THREE.FloatType,
-    stencilBuffer: false,
   })
 
   const particles = useMemo(() => {
@@ -134,36 +117,26 @@ export default function GpgpuParticleSystem() {
     return new THREE.BufferAttribute(p, 3)
   }, [])
 
-  let target = rtt
-  let pass = 0
-
   useFrame((state) => {
-    const { gl, clock, pointer, delta } = state
+    const { gl, clock, pointer } = state
 
-    const oldTarget = target
-    target = target === rtt ? rtt.clone() : rtt
-
-    if (simMaterialRef.current) {
-      simMaterialRef.current.uniforms.uPositions.value = oldTarget.texture
-      simMaterialRef.current.uniforms.uTime.value = clock.elapsedTime
-      simMaterialRef.current.uniforms.uDelta.value = delta
-      simMaterialRef.current.uniforms.uMouse.value.set(
-        pointer.x * (viewport.width / 2),
-        pointer.y * (viewport.height / 2),
-        0
-      )
-    }
-
-    gl.setRenderTarget(target)
+    // Run the simulation pass
+    gl.setRenderTarget(rtt)
     gl.clear()
+    const simMaterial = scene.children[0].material as THREE.ShaderMaterial
+    simMaterial.uniforms.uTime.value = clock.elapsedTime
+    simMaterial.uniforms.uMouse.value.set(
+      pointer.x * (viewport.width / 2),
+      pointer.y * (viewport.height / 2),
+      0
+    )
     gl.render(scene, camera)
     gl.setRenderTarget(null)
 
+    // Update the render material with the new positions
     if (renderMaterialRef.current) {
-      renderMaterialRef.current.uniforms.uPositions.value = target.texture
+      renderMaterialRef.current.uniforms.uPositions.value = rtt.texture
     }
-
-    pass++
   })
 
   return (
@@ -172,20 +145,18 @@ export default function GpgpuParticleSystem() {
         <mesh>
           <planeGeometry args={[2, 2]} />
           <shaderMaterial
-            ref={simMaterialRef}
             vertexShader={simulationVertexShader}
             fragmentShader={simulationFragmentShader}
             uniforms={{
-              uPositions: { value: positions },
+              uOriginalPositions: { value: originalPositions },
               uTime: { value: 0 },
-              uDelta: { value: 0 },
               uMouse: { value: new THREE.Vector3() },
             }}
           />
         </mesh>,
         scene
       )}
-      <points ref={pointsRef} frustumCulled={false}>
+      <points frustumCulled={false}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" {...particles} />
         </bufferGeometry>
@@ -195,10 +166,7 @@ export default function GpgpuParticleSystem() {
           fragmentShader={particleFragmentShader}
           uniforms={{
             uPositions: { value: null },
-            uSize: { value: 30.0 },
-            uColor: { value: new THREE.Color('cyan') },
-            uSpecularColor: { value: new THREE.Color('white') },
-            uShininess: { value: 32.0 },
+            uSize: { value: 25.0 },
           }}
           transparent
           blending={THREE.AdditiveBlending}
