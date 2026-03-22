@@ -73,8 +73,8 @@ async function init() {
 
   // ---- Scene ----
   app.scene = new THREE.Scene();
-  app.scene.fog = new THREE.FogExp2(0x0a0d14, 0.003);
-  app.scene.background = new THREE.Color(0x0a0d14);
+  app.scene.fog = new THREE.FogExp2(0x1a2a3a, 0.002);
+  app.scene.background = new THREE.Color(0x1a2a3a);
 
   // ---- Camera ----
   app.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
@@ -192,19 +192,7 @@ async function init() {
     reseed:      () => app.stateMachine.dispatch(EVENTS.RESEED_GUESS)
   });
 
-  // ---- State machine event hooks ----
-  app.stateMachine.on('stateChange', ({ state, prev }) => {
-    handleStateChange(state, prev);
-  });
-
-  app.stateMachine.on('solverSuccess', ({ result }) => {
-    handleSolverResult(result);
-  });
-
-  app.stateMachine.on('solverFailure', ({ result }) => {
-    handleSolverResult(result);
-  });
-
+  // ---- State machine event hooks (only for events NOT handled by constructor callbacks) ----
   app.stateMachine.on('firing', ({ solution }) => {
     launchProjectile(solution?.solution);
   });

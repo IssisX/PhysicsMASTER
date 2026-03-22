@@ -23,12 +23,12 @@ export function setupRenderer(THREE, canvas) {
 }
 
 export function setupLights(THREE, scene) {
-  // Ambient
-  const ambient = new THREE.AmbientLight(0x202840, 0.4);
+  // Ambient — bright enough to see terrain clearly
+  const ambient = new THREE.AmbientLight(0x607898, 1.2);
   scene.add(ambient);
 
-  // Directional (sun)
-  const sun = new THREE.DirectionalLight(0xfff4e0, 2.0);
+  // Directional (sun) — strong key light
+  const sun = new THREE.DirectionalLight(0xfff4e0, 3.0);
   sun.position.set(50, 100, 30);
   sun.castShadow = true;
   sun.shadow.mapSize.width  = isMobile ? 1024 : 2048;
@@ -41,12 +41,12 @@ export function setupLights(THREE, scene) {
   sun.shadow.bias = -0.0005;
   scene.add(sun);
 
-  // Hemisphere (sky/ground)
-  const hemi = new THREE.HemisphereLight(0x4488bb, 0x223311, 0.6);
+  // Hemisphere (sky/ground) — strong fill
+  const hemi = new THREE.HemisphereLight(0x88bbee, 0x446622, 1.0);
   scene.add(hemi);
 
-  // Fill light (soft blue)
-  const fill = new THREE.DirectionalLight(0x8090c0, 0.4);
+  // Fill light (soft blue, visible from the other side)
+  const fill = new THREE.DirectionalLight(0x8090c0, 0.8);
   fill.position.set(-30, 20, -50);
   scene.add(fill);
 
@@ -82,8 +82,8 @@ export function buildTerrain(THREE, scene, size = 400, resolution = 64) {
   const normalMap = generateProceduralNormalMap(THREE, 256);
 
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x3a5c2a,
-    roughness: 0.85,
+    color: 0x5a8c4a,
+    roughness: 0.8,
     metalness: 0.0,
     normalMap,
     normalScale: new THREE.Vector2(0.5, 0.5)

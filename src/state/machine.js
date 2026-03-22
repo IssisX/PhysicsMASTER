@@ -45,6 +45,10 @@ export class StateMachine {
         }
       },
       [STATES.PLANNING]: {
+        [EVENTS.PLAN_AND_FIRE_CLICKED]: {
+          next: STATES.PLANNING, // Retry from planning
+          handler: this._handlePlanAndFire.bind(this)
+        },
         [EVENTS.SOLVER_SUCCESS]: {
           next: STATES.PLANNED,
           handler: this._handleSolverSuccess.bind(this)

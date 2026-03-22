@@ -492,16 +492,17 @@ export async function solveFiringSolution(params) {
  * Returns { solve: async (params) => result, terminate: () => void }
  */
 export function createSolverWorker() {
+  // Build self-contained worker code with constants inlined
   const solverCode = `
+// --- Inlined constants (module-scoped in source, must be duplicated here) ---
+const DEG2RAD = ${DEG2RAD};
+const RAD2DEG = ${RAD2DEG};
+const MAX_ITER = ${MAX_ITER};
+
 ${rk4Step.toString()}
 ${simulateTrajectory.toString()}
 ${objective.toString()}
 ${solveFiringSolution.toString()}
-
-// Expose performance.now in worker context
-if (typeof performance === 'undefined') {
-  self.performance = { now: () => Date.now() };
-}
 
 self.onmessage = async function(e) {
   const { id, params } = e.data;
@@ -509,22 +510,32 @@ self.onmessage = async function(e) {
     const result = await solveFiringSolution(params);
     self.postMessage({ id, result });
   } catch(err) {
-    self.postMessage({ id, error: err.message });
+    self.postMessage({ id, error: err.message || String(err) });
   }
 };
 `;
 
-  const blob = new Blob([solverCode], { type: 'application/javascript' });
-  const url = URL.createObjectURL(blob);
-  const worker = new Worker(url);
+  let worker;
+  let workerAlive = true;
+  try {
+    const blob = new Blob([solverCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    worker = new Worker(url);
+    URL.revokeObjectURL(url); // safe to revoke after construction
+  } catch (err) {
+    console.warn('[SolverWorker] Failed to create worker, using main-thread fallback:', err.message);
+    return _mainThreadFallback();
+  }
 
   let _idCounter = 0;
   const _pending = new Map();
+  const TIMEOUT_MS = 15000;
 
   worker.onmessage = (e) => {
     const { id, result, error } = e.data;
     const handler = _pending.get(id);
     if (handler) {
+      clearTimeout(handler.timer);
       _pending.delete(id);
       if (error) handler.reject(new Error(error));
       else handler.resolve(result);
@@ -533,18 +544,46 @@ self.onmessage = async function(e) {
 
   worker.onerror = (e) => {
     console.error('[SolverWorker] Error:', e.message);
+    // Reject ALL pending promises so the state machine doesn't hang
+    for (const [id, handler] of _pending) {
+      clearTimeout(handler.timer);
+      handler.reject(new Error(`Worker error: ${e.message}`));
+    }
+    _pending.clear();
+    workerAlive = false;
   };
 
   return {
-    solve: (params) => new Promise((resolve, reject) => {
-      const id = ++_idCounter;
-      _pending.set(id, { resolve, reject });
-      worker.postMessage({ id, params });
-    }),
+    solve: (params) => {
+      // If worker died, fall back to main thread
+      if (!workerAlive) {
+        console.warn('[SolverWorker] Worker dead, running solver on main thread');
+        return solveFiringSolution(params);
+      }
+      return new Promise((resolve, reject) => {
+        const id = ++_idCounter;
+        const timer = setTimeout(() => {
+          _pending.delete(id);
+          console.warn('[SolverWorker] Timeout, falling back to main thread');
+          solveFiringSolution(params).then(resolve, reject);
+        }, TIMEOUT_MS);
+        _pending.set(id, { resolve, reject, timer });
+        worker.postMessage({ id, params });
+      });
+    },
     terminate: () => {
-      URL.revokeObjectURL(url);
+      for (const [, handler] of _pending) clearTimeout(handler.timer);
+      _pending.clear();
       worker.terminate();
     }
+  };
+}
+
+/** Main-thread fallback solver interface (same API as worker) */
+function _mainThreadFallback() {
+  return {
+    solve: (params) => solveFiringSolution(params),
+    terminate: () => {}
   };
 }
 
