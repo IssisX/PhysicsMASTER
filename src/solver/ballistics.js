@@ -10,8 +10,10 @@ const MAX_ITER = 32;
  * state = [x,y,z,vx,vy,vz]
  * Returns new state (uses pre-allocated output array)
  */
-function rk4Step(state, dt, gravity, wind, k_drag, enableDrag, out) {
+function rk4Step(state, dt, gravity, wind, k_drag, enableDrag, out, coriolis, magnus) {
   // k_drag = 0.5 * Cd * rho * A / m
+  // coriolis = {omega_y, omega_z} or null  (Earth rotation components at latitude)
+  // magnus   = {kMagnus} or null           (spin-dependent lift coefficient)
   function deriv(s, d) {
     const rx = s[3] - wind.vx;
     const ry = s[4] - wind.vy;
@@ -24,6 +26,22 @@ function rk4Step(state, dt, gravity, wind, k_drag, enableDrag, out) {
     d[3] = -drag * rx;
     d[4] = gravity - drag * ry;
     d[5] = -drag * rz;
+
+    // Coriolis: F = -2m(omega x v) — simplified for Earth rotation
+    if (coriolis) {
+      // omega = (0, omega_y, omega_z) in local frame
+      // -2(omega x v) components:
+      d[3] += -2 * (coriolis.omega_y * s[5] - coriolis.omega_z * s[4]);
+      d[4] += -2 * (coriolis.omega_z * s[3]);
+      d[5] += -2 * (coriolis.omega_y * (-s[3]) + coriolis.omega_z * 0);
+    }
+
+    // Magnus: lateral force perpendicular to velocity (simplified)
+    if (magnus && speed > 0.1) {
+      // Magnus force is perpendicular to velocity in the horizontal plane
+      d[3] += magnus.kMagnus * (-rz / speed);
+      d[5] += magnus.kMagnus * ( rx / speed);
+    }
   }
 
   const k1 = new Float64Array(6);
@@ -62,15 +80,30 @@ function simulateTrajectory(params, elevation, collectTrajectory = false) {
   const dt = params.dt || 0.01;
   const g = gravity; // signed (negative)
 
-  // k_drag = 0.5 * Cd * rho * A / m
   const k_drag = 0.5 * dragCoefficient * airDensity * projectileArea / projectileMass;
 
-  // Compute initial velocity vector
-  // elevation is angle above horizontal in the targetDir plane
+  // Coriolis parameters (Earth rotation)
+  let coriolis = null;
+  if (params.enableCoriolis && params.latitude !== undefined) {
+    const OMEGA_EARTH = 7.2921e-5; // rad/s
+    const lat = params.latitude * (Math.PI / 180);
+    coriolis = {
+      omega_y: OMEGA_EARTH * Math.cos(lat),
+      omega_z: OMEGA_EARTH * Math.sin(lat)
+    };
+  }
+
+  // Magnus parameters (spin drift)
+  let magnus = null;
+  if (params.spinRPM && params.spinRPM > 0) {
+    // Simplified Magnus: kMagnus ~ rho * A * v_surface / m
+    const spinRad = params.spinRPM * 2 * Math.PI / 60;
+    const radius = Math.sqrt(projectileArea / Math.PI);
+    magnus = { kMagnus: 0.5 * airDensity * projectileArea * radius * spinRad / projectileMass * 0.1 };
+  }
+
   const cosE = Math.cos(elevation);
   const sinE = Math.sin(elevation);
-
-  // targetDir is normalized XZ vector from launcher to target
   const vx = v0 * cosE * targetDir.x;
   const vy = v0 * sinE;
   const vz = v0 * cosE * targetDir.z;
@@ -88,27 +121,34 @@ function simulateTrajectory(params, elevation, collectTrajectory = false) {
   let t = 0;
   let maxT = maxTimeOfFlight;
   const samples = collectTrajectory ? [] : null;
-
-  // terrain height function (flat by default, can be extended)
   const terrainY = params.terrainHeight || 0;
+
+  // Energy tracking
+  let apexHeight = state[1];
+  let maxSpeed = v0;
+  const muzzleSpeed = v0;
 
   if (collectTrajectory) {
     samples.push({ x: state[0], y: state[1], z: state[2], t: 0 });
   }
 
-  let prevState = state.slice();
-  let landedY = terrainY;
-
   while (t < maxT) {
-    rk4Step(state, dt, g, wind, k_drag, enableDrag, next);
+    rk4Step(state, dt, g, wind, k_drag, enableDrag, next, coriolis, magnus);
     t += dt;
 
-    // Check if crossed terrain
+    // Track energy analytics
+    if (next[1] > apexHeight) apexHeight = next[1];
+    const spd = Math.sqrt(next[3]*next[3] + next[4]*next[4] + next[5]*next[5]);
+    if (spd > maxSpeed) maxSpeed = spd;
+
     if (next[1] <= terrainY) {
-      // Linear interpolation to find exact impact
       const frac = (state[1] - terrainY) / (state[1] - next[1]);
       const impactX = state[0] + frac * (next[0] - state[0]);
       const impactZ = state[2] + frac * (next[2] - state[2]);
+      const impactVx = state[3] + frac * (next[3] - state[3]);
+      const impactVy = state[4] + frac * (next[4] - state[4]);
+      const impactVz = state[5] + frac * (next[5] - state[5]);
+      const impactSpeed = Math.sqrt(impactVx*impactVx + impactVy*impactVy + impactVz*impactVz);
 
       if (collectTrajectory) {
         samples.push({ x: impactX, y: terrainY, z: impactZ, t: t });
@@ -118,12 +158,26 @@ function simulateTrajectory(params, elevation, collectTrajectory = false) {
       const dz = impactZ - launcherPose.pos.z;
       const range = Math.sqrt(dx*dx + dz*dz);
 
+      // Compute drift from straight-line aim
+      const aimX = launcherPose.pos.x + targetDir.x * range;
+      const aimZ = launcherPose.pos.z + targetDir.z * range;
+      const lateralDrift = Math.sqrt((impactX - aimX)**2 + (impactZ - aimZ)**2);
+
       return {
         range,
         height: terrainY,
         tof: t - dt + frac * dt,
         impactPos: { x: impactX, y: terrainY, z: impactZ },
-        trajectory: samples
+        impactSpeed,
+        trajectory: samples,
+        energyAnalytics: {
+          muzzleKE: 0.5 * projectileMass * muzzleSpeed * muzzleSpeed,
+          impactKE: 0.5 * projectileMass * impactSpeed * impactSpeed,
+          apexHeight: apexHeight - launcherPose.pos.y,
+          maxSpeed,
+          coriolisDrift: coriolis ? lateralDrift : 0,
+          magnusDrift: magnus ? lateralDrift : 0
+        }
       };
     }
 
@@ -134,15 +188,24 @@ function simulateTrajectory(params, elevation, collectTrajectory = false) {
     }
   }
 
-  // Did not land within maxTOF — return last position range
   const dx = state[0] - launcherPose.pos.x;
   const dz = state[2] - launcherPose.pos.z;
+  const finalSpeed = Math.sqrt(state[3]*state[3] + state[4]*state[4] + state[5]*state[5]);
   return {
     range: Math.sqrt(dx*dx + dz*dz),
     height: state[1],
     tof: maxT,
     impactPos: { x: state[0], y: state[1], z: state[2] },
-    trajectory: samples
+    impactSpeed: finalSpeed,
+    trajectory: samples,
+    energyAnalytics: {
+      muzzleKE: 0.5 * projectileMass * muzzleSpeed * muzzleSpeed,
+      impactKE: 0.5 * projectileMass * finalSpeed * finalSpeed,
+      apexHeight: apexHeight - launcherPose.pos.y,
+      maxSpeed,
+      coriolisDrift: 0,
+      magnusDrift: 0
+    }
   };
 }
 
@@ -464,7 +527,6 @@ export async function solveFiringSolution(params) {
   const elapsed = performance.now() - startTime;
   log(`Converged: elevation=${(theta*RAD2DEG).toFixed(3)}°, impactError=${impactError.toFixed(3)}m, iters=${iterations}, time=${elapsed.toFixed(1)}ms`);
 
-  // Determine arc type
   const selectedArc = theta > 44 * DEG2RAD ? 'high' : 'low';
 
   return {
@@ -476,12 +538,14 @@ export async function solveFiringSolution(params) {
       trajectory: finalResult.trajectory,
       tof: finalResult.tof,
       impactPos: finalResult.impactPos,
+      impactSpeed: finalResult.impactSpeed,
       impactError,
       iterations,
       relaxationAttempts,
       residual,
       bracketDeg: [bracket.a * RAD2DEG, bracket.b * RAD2DEG],
       planningTimeMs: elapsed,
+      energyAnalytics: finalResult.energyAnalytics || null,
       logs
     }
   };
